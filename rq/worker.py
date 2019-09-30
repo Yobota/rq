@@ -12,7 +12,7 @@ import sys
 import time
 import traceback
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 try:
@@ -55,6 +55,9 @@ blue = make_colorizer('darkblue')
 
 logger = logging.getLogger(__name__)
 
+MATURITY = os.environ.get("RQ_WORKER_MATURITY", "22:30:00")
+NOISE = os.environ.get("RQ_WORKER_LAG", "01:00:00")
+
 
 class StopRequested(Exception):
     pass
@@ -62,6 +65,38 @@ class StopRequested(Exception):
 
 def compact(l):
     return [x for x in l if x is not None]
+
+
+def parse_timedelta(string):
+    """Expects an input of the form 'HH:MM:SS'.
+    Takes a string and converts it to timedelta."""
+    time = datetime.strptime(string, "%H:%M:%S")
+    delta = timedelta(hours=time.hour, minutes=time.minute,
+                      seconds=time.second)
+    return delta
+
+
+def calculate_maturity_date(maturity=MATURITY, lag_string=NOISE):
+    """Returns the date when HerokuWorker should kill itself.
+    Takes a string defining maturity timedelta and uniform
+    stochastisity to be added to maturity."""
+    random.seed()
+    max_lag = parse_timedelta(lag_string)
+    try:
+        noise = timedelta(seconds=random.randrange(0, max_lag.seconds))
+    except ValueError:
+        noise = timedelta(seconds=0)
+    now = datetime.utcnow()
+    time_delta = parse_timedelta(maturity)
+    maturity_time = now + time_delta + noise
+    return maturity_time
+
+
+def kill_process():
+    """Sends SIGTERM to the current process."""
+    pid = os.getpid()
+    sigterm = signal.SIGTERM
+    os.kill(pid, sigterm)
 
 
 _signames = dict((getattr(signal, signame), signame)
@@ -116,7 +151,8 @@ class Worker(object):
         workers = [cls.find_by_key(as_text(key),
                                    connection=connection,
                                    job_class=job_class,
-                                   queue_class=queue_class)
+                                   queue_class=queue_class)import signal
+from datetime import datetime, timedelta
                    for key in worker_keys]
         return compact(workers)
 
@@ -949,13 +985,60 @@ class HerokuWorker(Worker):
     * sends SIGRTMIN to work horses on SIGTERM to the main process which in turn
     causes the horse to crash `imminent_shutdown_delay` seconds later
     """
-    imminent_shutdown_delay = 6
+    imminent_shutdown_delay = 28
 
     frame_properties = ['f_code', 'f_lasti', 'f_lineno', 'f_locals', 'f_trace']
     if PY2:
         frame_properties.extend(
             ['f_exc_traceback', 'f_exc_type', 'f_exc_value', 'f_restricted']
         )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.maturity_date = calculate_maturity_date()
+
+    def dequeue_job_and_maintain_ttl(self, timeout):
+        """This function monitors the queue until a job appears. Once the job
+        is picked up, a non-cycling heartbeat is done and the job is returned.
+        It overwrites the rq worker function of the same name and is
+        highly simillar to it, changing only one heartbeat logic and minor
+        linting modifications."""
+        result = None
+        qnames = ",".join(self.queue_names())
+        self.set_state(WorkerStatus.IDLE)
+        self.procline("Listening on " + qnames)
+        self.log.debug("*** Listening on %s...", green(qnames))
+        while True:
+            self.heartbeat()
+            try:
+                connection = self.connection
+                result = self.queue_class.dequeue_any(self.queues, timeout,
+                                                      connection=connection,
+                                                      job_class=self.job_class)
+                if result is not None:
+                    job, queue = result
+                    message = "{0}: {1} ({2})".format(green(queue.name),
+                                                      blue(job.description),
+                                                      job.id)
+                    self.log.info(message)
+                break
+            except DequeueTimeout:
+                pass
+        # the SIGTERM logic in heartbeat should not be triggered here because
+        # there is a job that has been dequeued and is unprocessed
+        self.heartbeat(cycle_on_maturity=False)
+        return result
+
+    # pylint: disable=arguments-differ
+    def heartbeat(self, timeout=None, pipeline=None, cycle_on_maturity=True):
+        """Checks whether the worker has not exceeded his maturity. Once the
+        worker becomes mature and free, SIGTERM is sent after a heartbeat."""
+        super().heartbeat(timeout, pipeline)
+        is_free = self.get_state() == WorkerStatus.IDLE
+        is_mature = datetime.utcnow() > self.maturity_date
+        if is_mature and is_free and cycle_on_maturity:
+            self.log.info("Worker recycling due to reaching maturity.")
+            kill_process()
 
     def setup_work_horse_signals(self):
         """Modified to ignore SIGINT and SIGTERM and only handle SIGRTMIN"""
